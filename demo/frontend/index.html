@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Starlink In-Flight · Mission Control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet" />
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+  body { font-family: 'JetBrains Mono', monospace; color: #fff; }
+  #stage { position: relative; width: 100vw; height: 100vh; }
+  canvas { position: absolute; inset: 0; display: block; }
+
+  .hud { position: absolute; z-index: 10; pointer-events: none; }
+
+  /* Top-left timer */
+  #tl { top: 22px; left: 26px; }
+  #tl .tprefix { font-size: 9px; opacity: 0.30; letter-spacing: 0.15em; }
+  #tl .timer { font-size: 22px; font-weight: 300; line-height: 1.1; }
+  #tl .meta { font-size: 9px; opacity: 0.30; letter-spacing: 0.08em; margin-top: 4px; }
+
+  /* Top-center phase */
+  #phase {
+    top: 26px; left: 50%; transform: translateX(-50%);
+    font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase;
+    color: rgba(255,255,255,0.45); transition: color 0.6s ease; text-align: center;
+  }
+
+  /* Top-right controls */
+  #tr { top: 20px; right: 26px; display: flex; gap: 8px; pointer-events: auto; }
+  #tr button {
+    background: transparent; color: rgba(255,255,255,0.55);
+    border: 0.5px solid rgba(255,255,255,0.15); border-radius: 2px;
+    font-family: inherit; font-size: 9px; letter-spacing: 0.05em;
+    padding: 5px 9px; cursor: pointer; transition: all 0.25s ease;
+  }
+  #tr button:hover { color: rgba(255,255,255,0.85); }
+  #tr button.active { color: #fff; border-color: rgba(255,255,255,0.55); }
+
+  /* Bottom-right telemetry */
+  #br {
+    bottom: 24px; right: 26px; text-align: right;
+    font-size: 9px; opacity: 0.28; line-height: 1.9; letter-spacing: 0.06em;
+  }
+
+  /* Bottom-left model predictions */
+  #ml { bottom: 24px; left: 26px; pointer-events: auto; display: flex; flex-direction: column; }
+  #panel {
+    max-height: 0; overflow: hidden; transition: max-height 0.35s ease;
+    background: rgba(8,8,8,0.88); border: 0.5px solid rgba(255,255,255,0.10);
+    border-radius: 2px; width: 280px; margin-bottom: 8px;
+  }
+  #panel.open { max-height: 260px; }
+  #panel .inner { padding: 14px 16px; }
+  #panel .phead { font-size: 8px; color: rgba(255,255,255,0.22); letter-spacing: 0.08em; margin-bottom: 14px; }
+  .prow { margin-bottom: 13px; }
+  .prow .ptop { display: flex; align-items: baseline; gap: 8px; }
+  .prow .qlabel { font-size: 10px; color: rgba(255,255,255,0.65); width: 30px; }
+  .prow .qdesc { font-size: 8px; color: rgba(255,255,255,0.28); flex: 1; }
+  .prow .qval { font-size: 17px; font-weight: 300; color: #fff; transition: color 0.5s ease; }
+  .prow .qval .unit { font-size: 8px; opacity: 0.4; margin-left: 3px; }
+  .prow .bar { height: 1px; background: rgba(255,255,255,0.10); margin-top: 6px; position: relative; }
+  .prow .bar > i { position: absolute; left: 0; top: 0; height: 100%; background: rgba(255,255,255,0.7); transition: width 0.5s ease, background 0.5s ease; }
+  #toggle {
+    background: transparent; border: none; color: #fff; opacity: 0.28;
+    font-family: inherit; font-size: 9px; letter-spacing: 0.1em; cursor: pointer;
+    text-align: left; padding: 0; transition: opacity 0.25s ease;
+  }
+  #toggle:hover { opacity: 0.6; }
+
+  /* amber / red states */
+  .amber .qval, .amber.qval { color: #f5a623 !important; }
+  .amber .bar > i { background: #f5a623 !important; }
+  .red .qval, .red.qval { color: #ff3b30 !important; }
+  .red .bar > i { background: #ff3b30 !important; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="c"></canvas>
+
+  <div id="tl" class="hud">
+    <div class="tprefix">T+</div>
+    <div class="timer" id="timer">00:00:00</div>
+    <div class="meta">STARLINK IN-FLIGHT · AA1729 · JFK→LHR</div>
+  </div>
+
+  <div id="phase" class="hud">NOMINAL LINK</div>
+
+  <div id="tr" class="hud">
+    <button data-speed="1" class="active">1×</button>
+    <button data-speed="2">2×</button>
+    <button data-speed="5">5×</button>
+    <button id="replay">↺ REPLAY</button>
+  </div>
+
+  <div id="br" class="hud">
+    <div id="t-elev">ELEVATION 52°</div>
+    <div id="t-thr">THROUGHPUT 85.0 Mb/s</div>
+    <div id="t-loss">PKT LOSS 0.1%</div>
+  </div>
+
+  <div id="ml" class="hud">
+    <div id="panel">
+      <div class="inner">
+        <div class="phead">BitrateLSTM · qint8 · 15 features · next window</div>
+        <div class="prow" id="row-p50">
+          <div class="ptop">
+            <span class="qlabel">P50</span>
+            <span class="qdesc">median expected</span>
+            <span class="qval"><span class="num">74.0</span><span class="unit">Mb/s</span></span>
+          </div>
+          <div class="bar"><i></i></div>
+        </div>
+        <div class="prow" id="row-p90">
+          <div class="ptop">
+            <span class="qlabel">P90</span>
+            <span class="qdesc">90th percentile</span>
+            <span class="qval"><span class="num">80.8</span><span class="unit">Mb/s</span></span>
+          </div>
+          <div class="bar"><i></i></div>
+        </div>
+        <div class="prow" id="row-p95">
+          <div class="ptop">
+            <span class="qlabel">P95</span>
+            <span class="qdesc">95th percentile</span>
+            <span class="qval"><span class="num">83.3</span><span class="unit">Mb/s</span></span>
+          </div>
+          <div class="bar"><i></i></div>
+        </div>
+      </div>
+    </div>
+    <button id="toggle">▶ MODEL PREDICTIONS</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------- Canvas setup ----------
+  var canvas = document.getElementById('c');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0, DPR = 1, cx = 0, cy = 0, R = 0;
+
+  function resize() {
+    DPR = window.devicePixelRatio || 1;
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    cx = W / 2; cy = H / 2;
+    R = Math.min(W, H) * 0.36;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  var DEG = Math.PI / 180;
+
+  // ---------- Globe rotation ----------
+  var rotLon = 0;            // current rotation longitude offset (radians)
+  var ROT_SPEED = 0.018;     // rad/s
+  var tilt = -18 * DEG;      // view tilt (latitude axis tilt)
+
+  // Convert lon/lat (degrees) to 3D point on unit sphere, apply rotation + tilt.
+  // Returns {x,y,z, visible} where z>0 is toward viewer.
+  function project(lonDeg, latDeg) {
+    var lon = lonDeg * DEG + rotLon;
+    var lat = latDeg * DEG;
+    // sphere coords
+    var x = Math.cos(lat) * Math.sin(lon);
+    var y = Math.sin(lat);
+    var z = Math.cos(lat) * Math.cos(lon);
+    // apply tilt around X axis
+    var y2 = y * Math.cos(tilt) - z * Math.sin(tilt);
+    var z2 = y * Math.sin(tilt) + z * Math.cos(tilt);
+    return {
+      x: cx + x * R,
+      y: cy - y2 * R,
+      z: z2,
+      visible: z2 > 0
+    };
+  }
+
+  // ---------- Continents (lon/lat polygons, coarse but recognizable) ----------
+  var CONTINENTS = [
+    // North America
+    [[-168,65],[-160,71],[-140,70],[-128,70],[-110,68],[-95,72],[-82,73],[-74,68],[-64,60],[-56,52],[-66,45],[-70,42],[-74,40],[-76,35],[-81,31],[-80,25],[-90,29],[-97,28],[-97,22],[-105,22],[-110,30],[-117,32],[-124,40],[-124,48],[-130,55],[-140,60],[-150,59],[-158,57],[-165,60],[-168,65]],
+    // Greenland
+    [[-46,60],[-30,68],[-22,70],[-25,76],[-35,82],[-50,82],[-58,77],[-55,70],[-50,64],[-46,60]],
+    // South America
+    [[-81,8],[-76,10],[-70,12],[-62,10],[-52,5],[-50,0],[-44,-2],[-38,-6],[-35,-8],[-38,-13],[-40,-20],[-48,-25],[-53,-34],[-58,-38],[-62,-40],[-65,-45],[-69,-51],[-74,-52],[-71,-44],[-73,-37],[-71,-30],[-70,-23],[-71,-18],[-77,-12],[-81,-5],[-80,0],[-79,4],[-81,8]],
+    // Europe + Scandinavia
+    [[-10,43],[-2,43],[3,43],[5,40],[12,38],[16,40],[19,40],[18,45],[14,45],[13,46],[12,44],[15,44],[20,42],[24,41],[28,41],[30,45],[33,46],[30,50],[24,50],[22,54],[19,54],[14,54],[10,54],[8,57],[5,58],[8,63],[12,65],[16,68],[22,70],[28,71],[24,66],[20,63],[16,60],[12,57],[9,54],[4,51],[0,49],[-4,48],[-9,44],[-10,43]],
+    // UK / Ireland
+    [[-5,50],[-3,51],[0,51],[1,53],[-1,56],[-3,58],[-6,58],[-6,55],[-3,54],[-5,53],[-5,50]],
+    // Ireland
+    [[-10,52],[-6,52],[-6,55],[-10,55],[-10,52]],
+    // Africa
+    [[-17,15],[-16,21],[-10,27],[-5,32],[0,36],[10,37],[11,33],[20,32],[25,32],[32,31],[34,28],[37,22],[43,12],[51,12],[44,5],[42,-1],[40,-8],[40,-15],[35,-20],[33,-26],[27,-34],[20,-35],[18,-30],[14,-23],[12,-16],[13,-9],[9,-1],[9,4],[4,6],[-4,5],[-8,5],[-13,8],[-17,15]],
+    // Madagascar
+    [[44,-16],[50,-15],[50,-22],[46,-25],[44,-22],[44,-16]],
+    // Asia
+    [[33,46],[40,48],[48,46],[50,44],[53,40],[60,42],[68,40],[70,34],[62,30],[57,25],[50,25],[48,30],[44,38],[40,40],[36,42],[33,46]],
+    [[60,42],[70,45],[80,50],[90,52],[100,52],[110,54],[120,53],[130,52],[140,55],[145,60],[150,60],[160,62],[170,66],[178,68],[170,60],[162,58],[155,52],[143,48],[135,46],[130,42],[128,40],[122,40],[122,30],[118,24],[110,21],[108,15],[103,8],[100,8],[100,14],[98,16],[94,16],[90,22],[88,26],[80,30],[75,34],[70,38],[65,40],[60,42]],
+    // India tip
+    [[70,22],[74,18],[77,10],[80,12],[82,18],[80,22],[75,24],[70,22]],
+    // Southeast Asia (islands)
+    [[95,5],[100,2],[105,0],[110,-3],[114,-7],[108,-7],[102,-5],[97,2],[95,5]],
+    [[110,-1],[118,-2],[122,-3],[118,1],[112,2],[110,-1]],
+    // Japan
+    [[130,31],[133,34],[138,35],[141,38],[141,41],[144,43],[140,40],[137,37],[133,33],[130,31]],
+    // Australia
+    [[113,-22],[114,-28],[118,-34],[123,-34],[129,-32],[135,-35],[138,-35],[141,-38],[146,-39],[150,-37],[153,-31],[153,-25],[146,-19],[142,-11],[136,-12],[130,-12],[124,-16],[116,-20],[113,-22]]
+  ];
+
+  // ---------- Geography drawing with back-face culling + clip ----------
+  function drawGlobe() {
+    // ocean disk
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+    ctx.fillStyle = '#0d0d0d';
+    ctx.fill();
+
+    // atmospheric rim glow
+    ctx.save();
+    var grad = ctx.createRadialGradient(cx, cy, R * 0.92, cx, cy, R * 1.10);
+    grad.addColorStop(0, 'rgba(60,130,220,0)');
+    grad.addColorStop(0.6, 'rgba(60,130,220,0.10)');
+    grad.addColorStop(1, 'rgba(60,130,220,0)');
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * 1.10, 0, Math.PI * 2);
+    ctx.fillStyle = grad;
+    ctx.fill();
+    ctx.restore();
+
+    // clip to globe
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+    ctx.clip();
+
+    drawGraticule();
+    drawContinents();
+
+    ctx.restore();
+
+    // crisp rim
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  function drawGraticule() {
+    ctx.lineWidth = 0.5;
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    // meridians
+    for (var lon = -180; lon < 180; lon += 30) {
+      var started = false;
+      ctx.beginPath();
+      for (var lat = -90; lat <= 90; lat += 4) {
+        var p = project(lon, lat);
+        if (p.visible) {
+          if (!started) { ctx.moveTo(p.x, p.y); started = true; }
+          else ctx.lineTo(p.x, p.y);
+        } else { started = false; }
+      }
+      ctx.stroke();
+    }
+    // parallels
+    for (var lt = -60; lt <= 60; lt += 30) {
+      var st = false;
+      ctx.beginPath();
+      for (var ln = -180; ln <= 180; ln += 4) {
+        var q = project(ln, lt);
+        if (q.visible) {
+          if (!st) { ctx.moveTo(q.x, q.y); st = true; }
+          else ctx.lineTo(q.x, q.y);
+        } else { st = false; }
+      }
+      ctx.stroke();
+    }
+  }
+
+  function drawContinents() {
+    for (var i = 0; i < CONTINENTS.length; i++) {
+      var poly = CONTINENTS[i];
+      // Build segments split where points go behind the globe (back-face culling).
+      var seg = [];
+      var fillPts = [];
+      for (var j = 0; j < poly.length; j++) {
+        var p = project(poly[j][0], poly[j][1]);
+        if (p.visible) {
+          seg.push(p);
+          fillPts.push(p);
+        } else if (seg.length) {
+          strokeSeg(seg); seg = [];
+        }
+      }
+      if (seg.length) strokeSeg(seg);
+
+      // subtle fill only if a good chunk of the polygon is front-facing
+      if (fillPts.length > poly.length * 0.7 && fillPts.length > 3) {
+        ctx.beginPath();
+        ctx.moveTo(fillPts[0].x, fillPts[0].y);
+        for (var k = 1; k < fillPts.length; k++) ctx.lineTo(fillPts[k].x, fillPts[k].y);
+        ctx.closePath();
+        ctx.fillStyle = '#1c1c1c';
+        ctx.fill();
+      }
+    }
+  }
+
+  function strokeSeg(seg) {
+    if (seg.length < 2) return;
+    ctx.beginPath();
+    ctx.moveTo(seg[0].x, seg[0].y);
+    for (var i = 1; i < seg.length; i++) ctx.lineTo(seg[i].x, seg[i].y);
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 0.8;
+    ctx.stroke();
+  }
+
+  // ---------- Great circle arc JFK -> LHR ----------
+  var JFK = { lon: -73.8, lat: 40.6 };
+  var LHR = { lon: -0.5, lat: 51.5 };
+
+  // spherical linear interpolation between two lon/lat points -> returns lon/lat
+  function slerp(a, b, t) {
+    var ax = Math.cos(a.lat*DEG)*Math.cos(a.lon*DEG),
+        ay = Math.cos(a.lat*DEG)*Math.sin(a.lon*DEG),
+        az = Math.sin(a.lat*DEG);
+    var bx = Math.cos(b.lat*DEG)*Math.cos(b.lon*DEG),
+        by = Math.cos(b.lat*DEG)*Math.sin(b.lon*DEG),
+        bz = Math.sin(b.lat*DEG);
+    var dot = ax*bx + ay*by + az*bz;
+    dot = Math.max(-1, Math.min(1, dot));
+    var omega = Math.acos(dot);
+    var so = Math.sin(omega);
+    var s1, s2;
+    if (so < 1e-6) { s1 = 1 - t; s2 = t; }
+    else { s1 = Math.sin((1-t)*omega)/so; s2 = Math.sin(t*omega)/so; }
+    var x = ax*s1 + bx*s2, y = ay*s1 + by*s2, z = az*s1 + bz*s2;
+    var lat = Math.asin(z) / DEG;
+    var lon = Math.atan2(y, x) / DEG;
+    return { lon: lon, lat: lat };
+  }
+
+  var ARC_PTS = [];
+  for (var ti = 0; ti <= 100; ti++) ARC_PTS.push(slerp(JFK, LHR, ti/100));
+
+  function drawArcAndAircraft(progress) {
+    // arc
+    var seg = [];
+    for (var i = 0; i < ARC_PTS.length; i++) {
+      var p = project(ARC_PTS[i].lon, ARC_PTS[i].lat);
+      if (p.visible) seg.push(p);
+      else { strokeArc(seg); seg = []; }
+    }
+    strokeArc(seg);
+
+    // city dots
+    drawCity(JFK, 'JFK');
+    drawCity(LHR, 'LHR');
+
+    // aircraft position
+    var ac = slerp(JFK, LHR, progress);
+    var ap = project(ac.lon, ac.lat);
+    if (ap.visible) {
+      ctx.beginPath();
+      ctx.arc(ap.x, ap.y, 11, 0, Math.PI*2);
+      ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(ap.x, ap.y, 3, 0, Math.PI*2);
+      ctx.fillStyle = '#fff';
+      ctx.fill();
+    }
+    return ap;
+  }
+
+  function strokeArc(seg) {
+    if (seg.length < 2) return;
+    ctx.beginPath();
+    ctx.moveTo(seg[0].x, seg[0].y);
+    for (var i = 1; i < seg.length; i++) ctx.lineTo(seg[i].x, seg[i].y);
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  function drawCity(city, label) {
+    var p = project(city.lon, city.lat);
+    if (!p.visible) return;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 2.5, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.fill();
+    ctx.font = '9px "JetBrains Mono", monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fillText(label, p.x + 7, p.y + 3);
+  }
+
+  // ---------- Satellites ----------
+  // Each satellite has an orbital plane defined by inclination + node, and a base phase.
+  var SATS = [
+    { inc: 53*DEG,  node: 20*DEG,  phase: 0.0,  rad: 1.35 },
+    { inc: 70*DEG,  node: 110*DEG, phase: 1.7,  rad: 1.42 },
+    { inc: 33*DEG,  node: 200*DEG, phase: 3.0,  rad: 1.30 },
+    { inc: 60*DEG,  node: 300*DEG, phase: 4.5,  rad: 1.48 }
+  ];
+
+  // Position of satellite given its own angle theta around its orbital plane.
+  function satPoint(sat, theta) {
+    // point in orbital plane (circle radius sat.rad in sphere units)
+    var ox = Math.cos(theta) * sat.rad;
+    var oy = Math.sin(theta) * sat.rad;
+    var oz = 0;
+    // incline around X axis
+    var y1 = oy * Math.cos(sat.inc) - oz * Math.sin(sat.inc);
+    var z1 = oy * Math.sin(sat.inc) + oz * Math.cos(sat.inc);
+    var x1 = ox;
+    // rotate around Y by node
+    var x2 = x1 * Math.cos(sat.node) + z1 * Math.sin(sat.node);
+    var z2 = -x1 * Math.sin(sat.node) + z1 * Math.cos(sat.node);
+    var y2 = y1;
+    // apply globe rotation (around Y) so orbits share the spin frame partly
+    var rl = rotLon * 0.3;
+    var x3 = x2 * Math.cos(rl) + z2 * Math.sin(rl);
+    var z3 = -x2 * Math.sin(rl) + z2 * Math.cos(rl);
+    var y3 = y2;
+    // apply view tilt around X
+    var y4 = y3 * Math.cos(tilt) - z3 * Math.sin(tilt);
+    var z4 = y3 * Math.sin(tilt) + z3 * Math.cos(tilt);
+    var x4 = x3;
+    return {
+      x: cx + x4 * R,
+      y: cy - y4 * R,
+      z: z4,
+      front: z4 > -0.2 * R / R // z4 in sphere units; front if z4 > ~0
+    };
+  }
+
+  function drawSatOrbit(sat) {
+    ctx.save();
+    ctx.setLineDash([4, 5]);
+    ctx.lineWidth = 0.6;
+    var first = true;
+    ctx.beginPath();
+    for (var a = 0; a <= Math.PI*2 + 0.01; a += 0.08) {
+      var p = satPoint(sat, a);
+      if (first) { ctx.moveTo(p.x, p.y); first = false; }
+      else ctx.lineTo(p.x, p.y);
+    }
+    ctx.strokeStyle = 'rgba(70,140,230,0.22)';
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawSatellite(p, isActive, elevLabel) {
+    var front = p.z > 0;
+    var op = front ? 1 : 0.32;
+    ctx.save();
+    ctx.globalAlpha = op;
+    var size = isActive ? 8 : 5.5;
+
+    if (isActive && front) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, size + 8, 0, Math.PI*2);
+      ctx.strokeStyle = 'rgba(70,150,240,0.35)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+    // diamond outline
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y - size);
+    ctx.lineTo(p.x + size, p.y);
+    ctx.lineTo(p.x, p.y + size);
+    ctx.lineTo(p.x - size, p.y);
+    ctx.closePath();
+    ctx.strokeStyle = 'rgba(90,160,250,0.9)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    // center dot
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 1.6, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(120,180,255,1)';
+    ctx.fill();
+
+    if (isActive && front && elevLabel) {
+      ctx.globalAlpha = 0.6;
+      ctx.font = '8px "JetBrains Mono", monospace';
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillText(elevLabel, p.x + size + 6, p.y + 3);
+    }
+    ctx.restore();
+  }
+
+  // ---------- Beam ----------
+  function drawBeam(satP, acP, mode) {
+    // mode: 'normal' | 'degrade' | 'recovery' (color/opacity), none if outage
+    if (!satP || !acP) return;
+    var beamColor, lineColor, alpha, halfWidth;
+    if (mode === 'recovery') {
+      beamColor = 'rgba(90,160,250,';
+      lineColor = 'rgba(120,180,255,';
+      alpha = 0.16; halfWidth = 14;
+    } else if (mode === 'degrade') {
+      beamColor = 'rgba(255,255,255,';
+      lineColor = 'rgba(255,255,255,';
+      alpha = 0.07; halfWidth = 7;
+    } else {
+      beamColor = 'rgba(255,255,255,';
+      lineColor = 'rgba(255,255,255,';
+      alpha = 0.14; halfWidth = 16;
+    }
+
+    var dx = acP.x - satP.x, dy = acP.y - satP.y;
+    var len = Math.hypot(dx, dy) || 1;
+    var px = -dy/len, py = dx/len;
+    // cone widens at aircraft end
+    var ax1 = acP.x + px*halfWidth, ay1 = acP.y + py*halfWidth;
+    var ax2 = acP.x - px*halfWidth, ay2 = acP.y - py*halfWidth;
+
+    ctx.beginPath();
+    ctx.moveTo(satP.x, satP.y);
+    ctx.lineTo(ax1, ay1);
+    ctx.lineTo(ax2, ay2);
+    ctx.closePath();
+    ctx.fillStyle = beamColor + alpha + ')';
+    ctx.fill();
+
+    // center line
+    ctx.beginPath();
+    ctx.moveTo(satP.x, satP.y);
+    ctx.lineTo(acP.x, acP.y);
+    ctx.strokeStyle = lineColor + (mode === 'degrade' ? 0.3 : 0.6) + ')';
+    ctx.lineWidth = mode === 'degrade' ? 0.6 : 1;
+    ctx.stroke();
+  }
+
+  function drawOutageRing(acP, t) {
+    if (!acP) return;
+    var pulse = (Math.sin(t * 0.005) + 1) / 2; // 0..1
+    var r = 12 + pulse * 18;
+    ctx.beginPath();
+    ctx.arc(acP.x, acP.y, r, 0, Math.PI*2);
+    ctx.strokeStyle = 'rgba(255,59,48,' + (0.5 - pulse*0.4) + ')';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(acP.x, acP.y, 12, 0, Math.PI*2);
+    ctx.strokeStyle = 'rgba(255,59,48,0.7)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // ---------- Scenario ----------
+  function gauss(mean, sd) {
+    var u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return mean + sd * Math.sqrt(-2*Math.log(u)) * Math.cos(2*Math.PI*v);
+  }
+  function lerp(a,b,t){ return a + (b-a)*t; }
+
+  var PHASES = [
+    { name: 'Normal',      label: 'NOMINAL LINK',            ticks: 30, color: 'rgba(255,255,255,0.45)' },
+    { name: 'Degradation', label: 'ELEVATION DEGRADING',     ticks: 25, color: 'rgba(245,166,35,0.85)' },
+    { name: 'Outage',      label: 'LINK FAILURE · HANDOFF',  ticks: 15, color: 'rgba(255,59,48,0.95)' },
+    { name: 'Recovery',    label: 'ACQUIRING NEW SATELLITE', ticks: 30, color: 'rgba(90,160,250,0.85)' },
+    { name: 'Normal2',     label: 'NOMINAL LINK',            ticks: 20, color: 'rgba(255,255,255,0.45)' }
+  ];
+  var TOTAL = 120;
+
+  function phaseAt(frame) {
+    var acc = 0;
+    for (var i = 0; i < PHASES.length; i++) {
+      if (frame < acc + PHASES[i].ticks) {
+        return { idx: i, local: frame - acc, len: PHASES[i].ticks, def: PHASES[i] };
+      }
+      acc += PHASES[i].ticks;
+    }
+    var last = PHASES.length - 1;
+    return { idx: last, local: PHASES[last].ticks - 1, len: PHASES[last].ticks, def: PHASES[last] };
+  }
+
+  // base telemetry per phase
+  function telemetry(frame) {
+    var ph = phaseAt(frame);
+    var f = ph.local / Math.max(1, ph.len - 1);
+    var thr, rtt, loss, elev;
+    switch (ph.def.name) {
+      case 'Normal':
+        thr = gauss(85, 1.5); rtt = gauss(28, 1.2); loss = Math.max(0, gauss(0.1, 0.05)); elev = gauss(52, 0.8);
+        break;
+      case 'Degradation':
+        thr = lerp(85, 23, f) + gauss(0, 1.5);
+        rtt = lerp(28, 118, f) + gauss(0, 3);
+        loss = lerp(0.1, 8, f) + gauss(0, 0.4);
+        elev = lerp(52, 12, f) + gauss(0, 0.6);
+        break;
+      case 'Outage':
+        thr = Math.max(0.2, gauss(1, 0.3));
+        rtt = gauss(280, 12);
+        loss = gauss(65, 4);
+        elev = gauss(5, 0.5);
+        break;
+      case 'Recovery':
+        thr = lerp(4, 86, f) + gauss(0, 1.8);
+        rtt = lerp(280, 22, f) + gauss(0, 4);
+        loss = lerp(65, 0, f) + gauss(0, 0.6);
+        elev = lerp(8, 50, f) + gauss(0, 0.8);
+        break;
+      default: // Normal2
+        thr = gauss(86, 1.5); rtt = gauss(22, 1.2); loss = Math.max(0, gauss(0.05, 0.04)); elev = gauss(51, 0.8);
+    }
+    return {
+      thr: Math.max(0, thr), rtt: Math.max(1, rtt),
+      loss: Math.max(0, Math.min(100, loss)), elev: Math.max(0, elev),
+      phase: ph
+    };
+  }
+
+  // ---------- State ----------
+  var frame = 0;
+  var speed = 1;
+  var startTime = Date.now();
+  var lastTel = telemetry(0);
+  var lastPhaseIdx = -1;
+  var toastText = '';
+  var toastUntil = 0;
+
+  var EVENTS = [
+    null,
+    'ELEVATION ANGLE DEGRADING\nSIGNAL MARGIN DROPPING',
+    'LINK FAILURE\nINITIATING SATELLITE HANDOFF',
+    'NEW SATELLITE ACQUIRED\nRE-ESTABLISHING UPLINK',
+    'LINK NOMINAL\nALL SYSTEMS GREEN'
+  ];
+
+  // ---------- HUD updates ----------
+  var elTimer = document.getElementById('timer');
+  var elPhase = document.getElementById('phase');
+  var elElev = document.getElementById('t-elev');
+  var elThr = document.getElementById('t-thr');
+  var elLoss = document.getElementById('t-loss');
+
+  function fmtTime(ms) {
+    var s = Math.floor(ms/1000);
+    var h = Math.floor(s/3600); s -= h*3600;
+    var m = Math.floor(s/60); s -= m*60;
+    function p(n){ return (n<10?'0':'')+n; }
+    return p(h)+':'+p(m)+':'+p(s);
+  }
+
+  function updateHUD(tel) {
+    elPhase.textContent = tel.phase.def.label;
+    elPhase.style.color = tel.phase.def.color;
+    elElev.textContent = 'ELEVATION ' + Math.round(tel.elev) + '°';
+    elThr.textContent = 'THROUGHPUT ' + tel.thr.toFixed(1) + ' Mb/s';
+    elLoss.textContent = 'PKT LOSS ' + tel.loss.toFixed(1) + '%';
+    updatePredictions(tel);
+  }
+
+  // ---------- HF Backend config ----------
+  // Replace with your Hugging Face Space URL after deployment.
+  // e.g. "https://justintulloch-starlink-demo.hf.space"
+  var HF_BASE = 'https://YOUR-HF-SPACE.hf.space';
+  var WS_URL  = HF_BASE.replace('https://', 'wss://') + '/ws/stream';
+  var JSON_URL = HF_BASE + '/scenario';
+
+  // Live predictions from model — updated each time HF responds
+  var livePreds = { p50: null, p90: null, p95: null };
+  var hfConnected = false;
+  var hfWs = null;
+  var hfFrames = [];   // full scenario pre-fetched as fallback
+  var hfFrameIdx = 0;
+
+  // ---------- Connection status indicator ----------
+  // Injected as a floating dot top-left under the timer — no layout change
+  var statusDot = document.createElement('div');
+  statusDot.style.cssText = [
+    'position:absolute', 'top:80px', 'left:26px',
+    'display:flex', 'align-items:center', 'gap:6px',
+    'font-size:8px', 'letter-spacing:0.12em',
+    'color:rgba(255,255,255,0.25)', 'pointer-events:none',
+    'z-index:10', 'transition:color 0.4s'
+  ].join(';');
+  statusDot.innerHTML = '<span id="hf-dot" style="width:5px;height:5px;border-radius:50%;background:rgba(255,255,255,0.2);display:inline-block;transition:background 0.4s"></span>' +
+                        '<span id="hf-label">CONNECTING TO MODEL</span>';
+  document.getElementById('stage').appendChild(statusDot);
+
+  function setHFStatus(state) {
+    var dot   = document.getElementById('hf-dot');
+    var label = document.getElementById('hf-label');
+    if (state === 'connected') {
+      dot.style.background   = 'rgba(90,210,120,0.9)';
+      label.textContent      = 'MODEL LIVE';
+      statusDot.style.color  = 'rgba(90,210,120,0.6)';
+    } else if (state === 'fallback') {
+      dot.style.background   = 'rgba(245,166,35,0.9)';
+      label.textContent      = 'MODEL CACHED';
+      statusDot.style.color  = 'rgba(245,166,35,0.5)';
+    } else if (state === 'offline') {
+      dot.style.background   = 'rgba(255,59,48,0.7)';
+      label.textContent      = 'SIMULATED · NO BACKEND';
+      statusDot.style.color  = 'rgba(255,59,48,0.4)';
+    } else {
+      dot.style.background   = 'rgba(255,255,255,0.2)';
+      label.textContent      = 'CONNECTING TO MODEL';
+      statusDot.style.color  = 'rgba(255,255,255,0.25)';
+    }
+  }
+
+  // ---------- WebSocket — real-time streaming from model ----------
+  function connectWS() {
+    if (HF_BASE.indexOf('YOUR-HF-SPACE') !== -1) {
+      setHFStatus('offline');
+      return; // placeholder URL — skip network attempts
+    }
+    try {
+      hfWs = new WebSocket(WS_URL);
+      hfWs.onopen = function() {
+        hfConnected = true;
+        setHFStatus('connected');
+        hfWs.send(JSON.stringify({ speed: speed }));
+      };
+      hfWs.onmessage = function(e) {
+        var msg = JSON.parse(e.data);
+        if (msg.done) return;
+        // Store latest predictions — tick() picks them up
+        if (msg.predictions) {
+          livePreds.p50 = msg.predictions.p50;
+          livePreds.p90 = msg.predictions.p90;
+          livePreds.p95 = msg.predictions.p95;
+        }
+      };
+      hfWs.onerror = function() {
+        hfConnected = false;
+        hfWs = null;
+        fetchJSONFallback();
+      };
+      hfWs.onclose = function() {
+        hfConnected = false;
+      };
+    } catch(e) {
+      fetchJSONFallback();
+    }
+  }
+
+  // ---------- JSON fallback — fetch full scenario once, replay in sync ----------
+  function fetchJSONFallback() {
+    setHFStatus('connecting');
+    fetch(JSON_URL)
+      .then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function(data) {
+        hfFrames = data.frames;
+        hfFrameIdx = 0;
+        setHFStatus('fallback');
+      })
+      .catch(function() {
+        setHFStatus('offline');
+        // Predictions fall back to synthetic values in updatePredictions()
+      });
+  }
+
+  // ---------- Predictions panel ----------
+  var rows = {
+    p50: document.getElementById('row-p50'),
+    p90: document.getElementById('row-p90'),
+    p95: document.getElementById('row-p95')
+  };
+  function setRow(row, val) {
+    row.querySelector('.num').textContent = val.toFixed(1);
+    var pct = Math.max(2, Math.min(100, (val / 90) * 100));
+    row.querySelector('.bar > i').style.width = pct + '%';
+  }
+
+  function updatePredictions(tel) {
+    var p50, p90, p95;
+
+    if (hfConnected && livePreds.p50 !== null) {
+      // Real-time WebSocket predictions from the actual model
+      p50 = livePreds.p50;
+      p90 = livePreds.p90;
+      p95 = livePreds.p95;
+    } else if (hfFrames.length && hfFrameIdx < hfFrames.length) {
+      // Pre-fetched JSON scenario — step in sync with scenario tick
+      var hfFrame = hfFrames[hfFrameIdx];
+      p50 = hfFrame.predictions.p50;
+      p90 = hfFrame.predictions.p90;
+      p95 = hfFrame.predictions.p95;
+      hfFrameIdx++;
+      if (hfFrameIdx >= hfFrames.length) hfFrameIdx = 0;
+    } else {
+      // Offline synthetic fallback — same math as before, clearly labelled
+      p50 = Math.max(0, tel.thr * 0.87 + gauss(0, 0.6));
+      p90 = Math.max(0, tel.thr * 0.95 + gauss(0, 0.5));
+      p95 = Math.max(0, tel.thr * 0.98 + gauss(0, 0.4));
+    }
+
+    setRow(rows.p50, p50);
+    setRow(rows.p90, p90);
+    setRow(rows.p95, p95);
+
+    var cls = '';
+    if (tel.phase.def.name === 'Degradation') cls = 'amber';
+    else if (tel.phase.def.name === 'Outage') cls = 'red';
+    ['p50','p90','p95'].forEach(function(k){
+      rows[k].classList.remove('amber','red');
+      if (cls) rows[k].classList.add(cls);
+    });
+  }
+
+  // ---------- Toast ----------
+  function showToast(txt) {
+    toastText = txt;
+    toastUntil = Date.now() + 3000;
+  }
+  function drawToast() {
+    if (Date.now() > toastUntil || !toastText) return;
+    var remain = toastUntil - Date.now();
+    var alpha = Math.min(1, remain / 600); // fade out last 600ms
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.font = '10px "JetBrains Mono", monospace';
+    var lines = toastText.split('\n');
+    var y = H * 0.46;
+    for (var i = 0; i < lines.length; i++) {
+      ctx.fillText(letterSpace(lines[i], 0.18), W/2, y + i * 22);
+    }
+    ctx.restore();
+    ctx.textAlign = 'start';
+  }
+  function letterSpace(str){ return str; } // canvas letter-spacing handled visually by font; kept simple
+
+  // ---------- Scenario loop ----------
+  var scenarioTimer = null;
+  function tick() {
+    var tel = telemetry(frame);
+    lastTel = tel;
+    // phase transition?
+    if (tel.phase.idx !== lastPhaseIdx) {
+      lastPhaseIdx = tel.phase.idx;
+      var ev = EVENTS[tel.phase.idx];
+      if (ev) showToast(ev);
+    }
+    updateHUD(tel);
+    frame++;
+    if (frame >= TOTAL) frame = 0; // loop scenario
+  }
+  function startScenario() {
+    if (scenarioTimer) clearInterval(scenarioTimer);
+    scenarioTimer = setInterval(tick, 1000 / speed);
+  }
+
+  // ---------- Render loop ----------
+  var prev = performance.now();
+  var pulseT = 0;
+  function render(now) {
+    var dt = (now - prev) / 1000; prev = now;
+    rotLon += ROT_SPEED * dt;
+    pulseT = now;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    // orbits behind
+    drawGlobe();
+
+    var tel = lastTel;
+    var progress = frame / TOTAL;
+
+    // satellite angle from real time (independent of scenario speed but scaled by speed)
+    var satBase = Date.now() * 0.0004 * speed;
+
+    // draw orbits
+    for (var i = 0; i < SATS.length; i++) drawSatOrbit(SATS[i]);
+
+    // compute sat positions
+    var positions = [];
+    for (var s = 0; s < SATS.length; s++) {
+      var theta = satBase + SATS[s].phase;
+      positions.push(satPoint(SATS[s], theta));
+    }
+
+    // aircraft
+    var acP = drawArcAndAircraft(progress);
+
+    var phaseName = tel.phase.def.name;
+    var activeP = positions[0];
+
+    // beam (behind sats? draw beam first then sats on top)
+    if (acP && acP.visible && activeP) {
+      if (phaseName === 'Normal' || phaseName === 'Normal2') drawBeam(activeP, acP, 'normal');
+      else if (phaseName === 'Degradation') drawBeam(activeP, acP, 'degrade');
+      else if (phaseName === 'Recovery') drawBeam(activeP, acP, 'recovery');
+      // outage: no beam
+      if (phaseName === 'Outage') drawOutageRing(acP, pulseT);
+    }
+
+    // draw satellites: back ones first
+    var order = positions.map(function(p,i){return {p:p,i:i};}).sort(function(a,b){return a.p.z - b.p.z;});
+    for (var o = 0; o < order.length; o++) {
+      var isActive = order[o].i === 0;
+      var elevLabel = (isActive && phaseName === 'Degradation') ? Math.round(tel.elev) + '°' : null;
+      drawSatellite(order[o].p, isActive, elevLabel);
+    }
+
+    drawToast();
+
+    // timer
+    elTimer.textContent = fmtTime(Date.now() - startTime);
+
+    requestAnimationFrame(render);
+  }
+
+  // ---------- Controls ----------
+  var speedBtns = document.querySelectorAll('#tr button[data-speed]');
+  speedBtns.forEach(function(btn){
+    btn.addEventListener('click', function(){
+      speed = parseInt(btn.getAttribute('data-speed'), 10);
+      speedBtns.forEach(function(b){ b.classList.remove('active'); });
+      btn.classList.add('active');
+      startScenario();
+      // Reconnect WS at new speed so server streams at correct rate
+      if (hfWs) { hfWs.close(); hfWs = null; }
+      hfFrameIdx = 0;
+      connectWS();
+    });
+  });
+  document.getElementById('replay').addEventListener('click', function(){
+    frame = 0; lastPhaseIdx = -1; startTime = Date.now();
+    hfFrameIdx = 0;
+    livePreds = { p50: null, p90: null, p95: null };
+    if (hfWs) { hfWs.close(); hfWs = null; }
+    startScenario();
+    connectWS();
+  });
+  var toggle = document.getElementById('toggle');
+  var panel = document.getElementById('panel');
+  toggle.addEventListener('click', function(){
+    var open = panel.classList.toggle('open');
+    toggle.textContent = (open ? '▼' : '▶') + ' MODEL PREDICTIONS';
+  });
+
+  // ---------- Boot ----------
+  updateHUD(lastTel);
+  startScenario();
+  connectWS();
+  requestAnimationFrame(render);
+})();
+</script>
+</body>
+</html>
